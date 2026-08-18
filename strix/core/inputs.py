@@ -13,6 +13,7 @@ from strix.config.models import (
     is_known_openai_bare_model,
     model_supports_reasoning,
 )
+from strix.core.context_budget import child_inherit_token_budget, trim_parent_history
 
 
 if TYPE_CHECKING:
@@ -151,6 +152,7 @@ def child_initial_input(
     parent_id: str,
     task: str,
     parent_history: list[Any],
+    max_parent_history_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """Build the initial input for a child agent as a single user message.
 
@@ -161,7 +163,12 @@ def child_initial_input(
     """
     parts: list[str] = []
     if parent_history:
-        rendered = json.dumps(parent_history, ensure_ascii=False, default=str)
+        if max_parent_history_tokens is None:
+            from strix.config import load_settings
+
+            max_parent_history_tokens = child_inherit_token_budget(load_settings())
+        trimmed_history = trim_parent_history(parent_history, max_parent_history_tokens)
+        rendered = json.dumps(trimmed_history, ensure_ascii=False, default=str)
         parts.append(
             "== Inherited context from parent (background only) ==\n"
             f"{rendered}\n"

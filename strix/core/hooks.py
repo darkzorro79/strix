@@ -7,13 +7,18 @@ from typing import TYPE_CHECKING, Any
 
 from agents.lifecycle import RunHooks
 
+from strix.config import load_settings
+from strix.core.agents import AgentCoordinator
+from strix.core.sessions import proactively_trim_session
 from strix.report.state import get_global_report_state
 
 
 if TYPE_CHECKING:
     from agents import RunContextWrapper
     from agents.agent import Agent
-    from agents.items import ModelResponse
+    from agents.items import ModelResponse, TResponseInputItem
+
+    from strix.config.settings import Settings
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +26,69 @@ logger = logging.getLogger(__name__)
 
 class BudgetExceededError(RuntimeError):
     """Raised when the accumulated LLM cost reaches the configured budget."""
+
+
+class ComposedRunHooks(RunHooks[dict[str, Any]]):
+    """Invoke multiple run hooks in registration order."""
+
+    def __init__(self, *hooks: RunHooks[dict[str, Any]]) -> None:
+        self._hooks = hooks
+
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper[dict[str, Any]],
+        agent: Agent[dict[str, Any]],
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        for hook in self._hooks:
+            await hook.on_llm_start(context, agent, system_prompt, input_items)
+
+    async def on_llm_end(
+        self,
+        context: RunContextWrapper[dict[str, Any]],
+        agent: Agent[dict[str, Any]],
+        response: ModelResponse,
+    ) -> None:
+        for hook in self._hooks:
+            await hook.on_llm_end(context, agent, response)
+
+
+class ContextBudgetHooks(RunHooks[dict[str, Any]]):
+    """Persistently trim SDK session history before each model call."""
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings
+
+    def _resolve_settings(self) -> Settings:
+        return self._settings or load_settings()
+
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper[dict[str, Any]],
+        agent: Agent[dict[str, Any]],
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        del agent, input_items
+        ctx = context.context if isinstance(context.context, dict) else {}
+        coordinator = ctx.get("coordinator")
+        agent_id = ctx.get("agent_id")
+        if not isinstance(coordinator, AgentCoordinator) or not isinstance(agent_id, str):
+            return
+
+        runtime = coordinator.runtimes.get(agent_id)
+        if runtime is None or runtime.session is None:
+            return
+
+        try:
+            await proactively_trim_session(
+                runtime.session,
+                self._resolve_settings(),
+                instructions=system_prompt,
+            )
+        except Exception:
+            logger.exception("proactive session trim failed for agent %s", agent_id)
 
 
 class ReportUsageHooks(RunHooks[dict[str, Any]]):

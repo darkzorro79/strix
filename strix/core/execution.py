@@ -16,8 +16,14 @@ from docker import errors as docker_errors  # type: ignore[import-untyped, unuse
 from openai import APIError
 
 from strix.core.hooks import BudgetExceededError
+from strix.config import load_settings
+from strix.core.context_budget import is_context_overflow_error, parse_overflow_prompt_tokens
 from strix.core.inputs import child_initial_input
-from strix.core.sessions import open_agent_session, strip_all_images_from_session
+from strix.core.sessions import (
+    open_agent_session,
+    strip_all_images_from_session,
+    trim_session_for_context_budget,
+)
 
 
 if TYPE_CHECKING:
@@ -346,6 +352,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     hooks: RunHooks[dict[str, Any]] | None,
 ) -> RunResultBase | None:
     image_strips = 0
+    context_strips = 0
     while True:
         try:
             await coordinator.mark_running(agent_id)
@@ -414,6 +421,31 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         "Stripped images from %s session after rejection; retrying (%d)",
                         agent_id,
                         image_strips,
+                    )
+                    input_data = []
+                    continue
+            if (
+                context_strips < 5
+                and session is not None
+                and is_context_overflow_error(exc)
+            ):
+                observed_prompt_tokens = parse_overflow_prompt_tokens(exc)
+                try:
+                    trimmed = await trim_session_for_context_budget(
+                        session,
+                        load_settings(),
+                        observed_prompt_tokens=observed_prompt_tokens,
+                        force=True,
+                    )
+                except Exception:
+                    logger.exception("context-budget recovery failed for %s", agent_id)
+                    trimmed = False
+                if trimmed:
+                    context_strips += 1
+                    logger.info(
+                        "Trimmed %s session after context overflow; retrying (%d)",
+                        agent_id,
+                        context_strips,
                     )
                     input_data = []
                     continue

@@ -22,6 +22,7 @@ from strix.config.models import (
     uses_chat_completions_tool_schema,
 )
 from strix.core.agents import AgentCoordinator
+from strix.core.context_budget import make_context_budget_filter
 from strix.core.execution import (
     respawn_subagents,
     run_agent_loop,
@@ -29,7 +30,7 @@ from strix.core.execution import (
 from strix.core.execution import (
     spawn_child_agent as start_child_agent,
 )
-from strix.core.hooks import BudgetExceededError, ReportUsageHooks
+from strix.core.hooks import BudgetExceededError, ComposedRunHooks, ContextBudgetHooks, ReportUsageHooks
 from strix.core.inputs import (
     DEFAULT_MAX_TURNS,
     build_root_task,
@@ -222,8 +223,12 @@ async def run_strix_scan(
             model_settings=model_settings,
             sandbox=SandboxRunConfig(client=bundle["client"], session=bundle["session"]),
             trace_include_sensitive_data=False,
+            call_model_input_filter=make_context_budget_filter(settings),
         )
-        hooks = ReportUsageHooks(model=resolved_model, max_budget_usd=max_budget_usd)
+        hooks = ComposedRunHooks(
+            ReportUsageHooks(model=resolved_model, max_budget_usd=max_budget_usd),
+            ContextBudgetHooks(settings),
+        )
 
         scope_context = build_scope_context(scan_config)
         root_context = _merge_root_prompt_context(scope_context, extra_system_prompt_context)

@@ -41,6 +41,13 @@ class LlmSettings(BaseSettings):
         alias="STRIX_FORCE_REQUIRED_TOOL_CHOICE",
     )
     timeout: int = Field(default=300, alias="LLM_TIMEOUT")
+    max_context_tokens: int = Field(default=131072, alias="STRIX_MAX_CONTEXT_TOKENS")
+    context_reserve_tokens: int = Field(default=65536, alias="STRIX_CONTEXT_RESERVE_TOKENS")
+    child_context_inherit_ratio: float = Field(
+        default=0.25,
+        alias="STRIX_CHILD_CONTEXT_INHERIT_RATIO",
+    )
+    memory_compressor_timeout: int = Field(default=120, alias="STRIX_MEMORY_COMPRESSOR_TIMEOUT")
 
 
 class RuntimeSettings(BaseSettings):
