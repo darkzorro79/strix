@@ -1,7 +1,13 @@
-"""``create_vulnerability_report`` — file a vuln finding with dedup + CVSS."""
+"""Reporting tools — file vuln findings (with dedup + CVSS) and read them back.
+
+``create_vulnerability_report`` / ``create_dependency_report`` file findings;
+``list_reports`` / ``get_report`` let any agent (notably the root orchestrator)
+review what's been filed so far across the whole scan.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -120,23 +126,25 @@ def _validate_cwe(cwe: str) -> str | None:
 
 
 def _calculate_cvss(breakdown: dict[str, str]) -> tuple[float, str, str]:
-    try:
-        from cvss import CVSS3
+    from cvss import CVSS3
 
-        vector = (
-            f"CVSS:3.1/AV:{breakdown['attack_vector']}/AC:{breakdown['attack_complexity']}/"
-            f"PR:{breakdown['privileges_required']}/UI:{breakdown['user_interaction']}/"
-            f"S:{breakdown['scope']}/C:{breakdown['confidentiality']}/"
-            f"I:{breakdown['integrity']}/A:{breakdown['availability']}"
-        )
-        c = CVSS3(vector)
-        score = c.scores()[0]
-        severity = c.severities()[0].lower()
-    except Exception:
-        logger.exception("Failed to calculate CVSS")
-        return 7.5, "high", ""
-    else:
-        return score, severity, vector
+    vector = (
+        f"CVSS:3.1/AV:{breakdown['attack_vector']}/AC:{breakdown['attack_complexity']}/"
+        f"PR:{breakdown['privileges_required']}/UI:{breakdown['user_interaction']}/"
+        f"S:{breakdown['scope']}/C:{breakdown['confidentiality']}/"
+        f"I:{breakdown['integrity']}/A:{breakdown['availability']}"
+    )
+
+    try:
+        cvss = CVSS3(vector)
+        score = cvss.scores()[0]
+        base_severity = cvss.severities()[0].lower()
+    except Exception as exc:
+        msg = f"Failed to calculate CVSS for validated vector: {vector}"
+        raise ValueError(msg) from exc
+
+    severity = "info" if base_severity == "none" else base_severity
+    return score, severity, vector
 
 
 _REQUIRED_FIELDS = {
@@ -227,7 +235,10 @@ async def _do_create(  # noqa: PLR0912
     if errors:
         return {"success": False, "error": "Validation failed", "errors": errors}
 
-    cvss_score, severity, _vector = _calculate_cvss(cvss_breakdown)
+    try:
+        cvss_score, severity, _vector = _calculate_cvss(cvss_breakdown)
+    except ValueError as exc:
+        return {"success": False, "error": "Validation failed", "errors": [str(exc)]}
 
     try:
         from strix.report.state import get_global_report_state
@@ -318,6 +329,21 @@ async def _do_create(  # noqa: PLR0912
         }
 
 
+def _caller_identity(ctx: RunContextWrapper) -> tuple[str | None, str | None]:
+    """Return the (agent_id, agent_name) of the agent invoking this tool."""
+    inner = ctx.context if isinstance(ctx.context, dict) else {}
+    raw_agent_id = inner.get("agent_id")
+    agent_id = raw_agent_id if isinstance(raw_agent_id, str) else None
+    agent_name: str | None = None
+    coordinator = inner.get("coordinator")
+    if agent_id is not None and coordinator is not None:
+        names = getattr(coordinator, "names", {})
+        if isinstance(names, dict):
+            raw_agent_name = names.get(agent_id)
+            agent_name = raw_agent_name if isinstance(raw_agent_name, str) else None
+    return agent_id, agent_name
+
+
 @function_tool(timeout=180, strict_mode=False)
 async def create_vulnerability_report(
     ctx: RunContextWrapper,
@@ -355,6 +381,30 @@ async def create_vulnerability_report(
       dynamically PoC'd — a vulnerable dependency version pinned in a
       lockfile/manifest that matches a published advisory. File those
       with ``create_dependency_report`` instead, never with this tool.
+
+    **Reporting and severity gate**:
+
+    - A reachable endpoint, unusual response, weak configuration, or
+      reconnaissance artifact is not by itself a vulnerability. File a
+      report only when the PoC demonstrates an unauthorized security
+      consequence or a realistic, fully validated path to one.
+    - Score only the reasonable final impact supported by the PoC. Do
+      not score speculative pivots or consequences that require another
+      unverified vulnerability.
+    - Network reachability and missing authentication affect
+      exploitability; neither creates Confidentiality, Integrity, or
+      Availability impact by itself.
+    - Public metadata, internal-looking names or addresses, software
+      versions, intended client-side code, and source maps without
+      secrets or restricted source normally have ``C:N``.
+    - Configuration and transport observations require a realistic
+      attacker-controlled exploit and direct security impact. Client
+      errors, compatibility issues, fingerprinting, and attack-surface
+      discovery alone should not be filed as vulnerabilities.
+    - Before filing, verify that the impact narrative, PoC, and every
+      non-None CVSS impact metric describe the same demonstrated
+      consequence. When evidence is incomplete, lower the metric or
+      continue validation; never choose a higher value "to be safe."
 
     Automatic LLM-based **deduplication** rejects reports that describe
     the same root cause on the same asset as an existing report. If you
@@ -409,6 +459,23 @@ async def create_vulnerability_report(
     - ``confidentiality`` / ``integrity`` / ``availability``: ``N`` /
       ``L`` / ``H``
 
+    Derive the vector from the demonstrated attack, not the finding
+    category or a scanner/template severity:
+
+    - ``C:L`` requires actual access to some restricted information.
+      Reconnaissance value alone is ``C:N``. ``C:H`` requires total
+      disclosure or limited disclosure with a direct serious impact,
+      such as a usable administrator credential or private key.
+    - ``I:L`` requires demonstrated unauthorized, limited modification;
+      ``I:H`` requires total or directly serious modification. Otherwise
+      use ``I:N``.
+    - ``A:L`` requires demonstrated performance degradation or service
+      interruption; ``A:H`` requires complete or directly serious
+      denial of the affected service. Otherwise use ``A:N``.
+    - Use ``S:C`` only when exploitation demonstrably crosses into a
+      component governed by a different security authority. A separate
+      backend, downstream effect, or third-party name is insufficient.
+
     Example::
 
         {
@@ -421,6 +488,30 @@ async def create_vulnerability_report(
             "integrity": "H",
             "availability": "H"
         }
+
+    **CVSS calibration** — score the weakness you actually proved, not a
+    hypothetical worst case. Most over-rating comes from these mistakes:
+
+    - **Don't presuppose a separate compromise.** If exploitation
+      requires the attacker to already hold a victim secret (a stolen
+      session cookie/token, a leaked one-time link, intercepted traffic),
+      that acquisition is not free. Do not score it as
+      ``privileges_required:N`` with ``attack_complexity:L`` as if
+      directly reachable, and do not rate a replay-of-captured-secret
+      issue High/Critical unless the *same* finding demonstrates a
+      concrete way to obtain that secret. Issues like a session that
+      survives logout or a replayable link are session-management /
+      defense-in-depth weaknesses — usually Low/Medium on their own.
+    - **Reserve ``H`` impact for demonstrated broad impact.** ``C:H`` /
+      ``I:H`` require proof of wide or systemic read/write. A single
+      user's data, a read-only information leak, or merely confirming
+      that an account / domain / software version *exists* (enumeration)
+      is ``C:L`` (often ``I:N``) — not ``C:H``.
+    - **Model required position and interaction honestly.** An
+      adversary-in-the-middle prerequisite (e.g. cleartext transmission)
+      or a required victim action is not guaranteed — reflect it in
+      ``attack_complexity`` / ``user_interaction`` instead of assuming the
+      ideal condition always holds.
 
     **CVE / CWE rules**: pass the bare ID only (``CVE-2024-1234``,
     ``CWE-89``) — no name, no parenthetical. Be 100% certain; if
@@ -457,7 +548,10 @@ async def create_vulnerability_report(
             (1-3 sentences) — it appears first in the report. Deep
             technical detail and root-cause analysis belong in
             ``technical_analysis``, not here.
-        impact: What an attacker achieves; business risk; data at risk.
+        impact: The unauthorized result demonstrated by the PoC, the
+            affected data or operation, and its scope. Keep plausible
+            but unverified follow-on risks separate; do not use them to
+            set CVSS metrics.
         target: Affected URL / domain / repository.
         technical_analysis: The mechanism and root cause.
         poc_description: Step-by-step reproduction (steps only, no code).
@@ -580,16 +674,7 @@ async def create_vulnerability_report(
             template engine's auto-escaping over string interpolation.
         fix_effort: "low"
     """
-    inner = ctx.context if isinstance(ctx.context, dict) else {}
-    raw_agent_id = inner.get("agent_id")
-    agent_id = raw_agent_id if isinstance(raw_agent_id, str) else None
-    agent_name = None
-    coordinator = inner.get("coordinator")
-    if agent_id is not None and coordinator is not None:
-        names = getattr(coordinator, "names", {})
-        if isinstance(names, dict):
-            raw_agent_name = names.get(agent_id)
-            agent_name = raw_agent_name if isinstance(raw_agent_name, str) else None
+    agent_id, agent_name = _caller_identity(ctx)
 
     result = await _do_create(
         title=title,
@@ -634,22 +719,162 @@ def _dependency_severity(advisory_cvss: float | None) -> tuple[float, str]:
     return score, "none"
 
 
+_VALID_REACHABILITY = frozenset(
+    {
+        "not_imported",
+        "imported",
+        "vulnerable_symbol_used",
+        "reachable_call_path",
+        "unknown",
+    }
+)
+
+
+def _validate_manifest_path(manifest_path: str | None) -> str | None:
+    """Return an error message when manifest_path is missing or unsafe."""
+    path = (manifest_path or "").strip()
+    if not path:
+        return (
+            "manifest_path is required: pass the repo-relative path of the "
+            "lockfile/manifest where the vulnerable version was observed "
+            "(trivy's Target, e.g. 'package-lock.json' or "
+            "'services/api/pom.xml'). It binds the finding to its exact file "
+            "so remediation can target the right repository."
+        )
+    if path.startswith("/") or "\\" in path or path.split("/")[0].endswith(":"):
+        return f"manifest_path must be a relative path within the repository, got {path!r}"
+    segments = path.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        return f"manifest_path must not contain empty, '.', or '..' segments, got {path!r}"
+    return None
+
+
+_MAX_CONTEXTUAL_REASONING_CHARS = 2000
+
+
+def _validate_contextual_cvss(
+    breakdown: dict[str, str] | None,
+    reasoning: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    if not breakdown:
+        errors.append(
+            "contextual_cvss_breakdown is required: rate the CVE in this codebase with "
+            "all 8 CVSS v3.1 metrics (attack_vector, attack_complexity, "
+            "privileges_required, user_interaction, scope, confidentiality, integrity, "
+            "availability). When your trace does not change the published rating, repeat "
+            "the advisory's own metrics and adjust only what the usage level proves - a "
+            "package the code never imports is normally N on all three impact metrics."
+        )
+    else:
+        for name, valid in _CVSS_VALID.items():
+            value = breakdown.get(name)
+            if value not in valid:
+                errors.append(
+                    f"Invalid contextual_cvss_breakdown {name}: {value}. Must be one of: {valid}"
+                )
+    if not (reasoning or "").strip():
+        errors.append(
+            "contextual_cvss_reasoning is required: state what you observed in this "
+            "codebase that justifies the contextual rating. A contextual score with "
+            "no reasoning is not shown."
+        )
+    return errors
+
+
+def _validate_advisory_cvss(advisory_cvss: float | None) -> str | None:
+    if advisory_cvss is None:
+        return (
+            "advisory_cvss is required: read the published advisory base score "
+            "(0.0-10.0) off the advisory (trivy CVSS / NVD / GHSA). It is the "
+            "published reference the finding is rated against — do not omit it "
+            "or the finding cannot be rated."
+        )
+    if not 0.0 <= advisory_cvss <= 10.0:
+        return f"advisory_cvss must be between 0.0 and 10.0, got {advisory_cvss}"
+    return None
+
+
+def _resolve_dependency_rating(
+    advisory_cvss: float | None,
+    contextual_cvss_breakdown: dict[str, str] | None,
+) -> tuple[float | None, str, float | None, str | None]:
+    """Rate the finding.
+
+    A contextual breakdown works exactly like a normal finding's
+    ``cvss_breakdown``: the agent supplies the 8 metrics as observed in this
+    codebase and the score/vector are computed from them. When provided it
+    rates the finding; the advisory score stays as the published reference.
+    """
+    if contextual_cvss_breakdown:
+        score, severity, vector = _calculate_cvss(contextual_cvss_breakdown)
+        return score, severity, score, vector
+    score, severity = _dependency_severity(advisory_cvss)
+    return score, severity, None, None
+
+
 def _build_dependency_metadata(
     *,
     package_name: str,
     installed_version: str,
     package_ecosystem: str | None,
     fixed_version: str | None,
-) -> dict[str, str]:
-    metadata = {
+    introduced_by: str | None,
+    dependency_path: str | None,
+    manifest_path: str | None = None,
+    reachability: str | None = None,
+    reachability_evidence: str | None = None,
+    advisory_cvss: float | None = None,
+    contextual_cvss_breakdown: dict[str, str] | None = None,
+    contextual_cvss_score: float | None = None,
+    contextual_cvss_vector: str | None = None,
+    contextual_cvss_reasoning: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "package_name": package_name.strip(),
         "installed_version": installed_version.strip(),
     }
+    if advisory_cvss is not None:
+        metadata["advisory_cvss"] = advisory_cvss
     if package_ecosystem and package_ecosystem.strip():
         metadata["package_ecosystem"] = package_ecosystem.strip()
+    if manifest_path and manifest_path.strip():
+        metadata["manifest_path"] = manifest_path.strip()
     if fixed_version and fixed_version.strip():
         metadata["fixed_version"] = fixed_version.strip()
+    if introduced_by and introduced_by.strip():
+        metadata["introduced_by"] = introduced_by.strip()
+    if dependency_path and dependency_path.strip():
+        metadata["dependency_path"] = dependency_path.strip()
+    if reachability and reachability.strip():
+        metadata["reachability"] = reachability.strip()
+        if reachability_evidence and reachability_evidence.strip():
+            metadata["reachability_evidence"] = reachability_evidence.strip()
+    # Contextual CVSS is only meaningful as the full breakdown, its computed
+    # score/vector, and the reasoning a reader can check — an incomplete set
+    # is dropped.
+    reasoning = str(contextual_cvss_reasoning or "").strip()
+    if (
+        contextual_cvss_breakdown
+        and contextual_cvss_score is not None
+        and contextual_cvss_vector
+        and reasoning
+    ):
+        metadata["contextual_cvss_breakdown"] = contextual_cvss_breakdown
+        metadata["contextual_cvss_score"] = contextual_cvss_score
+        metadata["contextual_cvss_vector"] = contextual_cvss_vector
+        metadata["contextual_cvss_reasoning"] = reasoning[:_MAX_CONTEXTUAL_REASONING_CHARS]
     return metadata
+
+
+_REACHABILITY_EVIDENCE_LABELS = {
+    "not_imported": "not imported by application code",
+    "imported": "imported by application code; affected API usage unconfirmed",
+    "vulnerable_symbol_used": "the advisory's affected API is used in application code",
+    "reachable_call_path": (
+        "a call path from application code to the vulnerable function was proven"
+    ),
+}
 
 
 def _build_dependency_evidence(
@@ -658,6 +883,10 @@ def _build_dependency_evidence(
     package_name: str,
     installed_version: str,
     fixed_version: str | None,
+    introduced_by: str | None,
+    dependency_path: str | None,
+    reachability: str | None = None,
+    reachability_evidence: str | None = None,
 ) -> str:
     evidence = (
         f"**Advisory evidence:** `{cve}` applies to `{package_name}` "
@@ -665,6 +894,22 @@ def _build_dependency_evidence(
     )
     if fixed_version and fixed_version.strip():
         evidence += f" The advisory is fixed in `{fixed_version.strip()}`."
+    if introduced_by and introduced_by.strip():
+        evidence += (
+            f"\n\n**Transitive dependency:** introduced by the direct "
+            f"dependency `{introduced_by.strip()}`."
+        )
+    if dependency_path and dependency_path.strip():
+        evidence += f"\n\n**Dependency chain:** `{dependency_path.strip()}`"
+    label = _REACHABILITY_EVIDENCE_LABELS.get((reachability or "").strip().lower())
+    if label:
+        evidence += f"\n\n**Usage analysis:** {label}."
+        if reachability_evidence and reachability_evidence.strip():
+            evidence += f" {reachability_evidence.strip()}"
+        evidence += (
+            " This is a prioritization signal from static analysis, not a"
+            " proof of exploitability or of safety."
+        )
     return evidence
 
 
@@ -685,6 +930,13 @@ async def _do_create_dependency(  # noqa: PLR0912
     advisory_cvss: float | None,
     technical_analysis: str | None,
     fix_effort: str,
+    introduced_by: str | None = None,
+    dependency_path: str | None = None,
+    manifest_path: str | None = None,
+    reachability: str = "unknown",
+    reachability_evidence: str | None = None,
+    contextual_cvss_breakdown: dict[str, str] | None = None,
+    contextual_cvss_reasoning: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
 ) -> dict[str, Any]:
@@ -721,30 +973,63 @@ async def _do_create_dependency(  # noqa: PLR0912
             f"Invalid fix_effort: {fix_effort!r}. Must be one of: {sorted(_VALID_FIX_EFFORT)}"
         )
 
-    if advisory_cvss is None:
+    manifest_err = _validate_manifest_path(manifest_path)
+    if manifest_err:
+        errors.append(manifest_err)
+
+    reachability = (reachability or "unknown").strip().lower()
+    if reachability not in _VALID_REACHABILITY:
         errors.append(
-            "advisory_cvss is required: read the published advisory base score "
-            "(0.0-10.0) off the advisory (trivy CVSS / NVD / GHSA). Severity is "
-            "derived solely from it — do not omit it or the finding cannot be rated."
+            f"Invalid reachability: {reachability!r}. Must be one of: {sorted(_VALID_REACHABILITY)}"
         )
-    elif not 0.0 <= advisory_cvss <= 10.0:
-        errors.append(f"advisory_cvss must be between 0.0 and 10.0, got {advisory_cvss}")
+    elif not (reachability_evidence or "").strip():
+        errors.append(
+            "reachability_evidence is required: cite the concrete proof (import "
+            "file:line, matched symbol usage, or govulncheck call path), or, for "
+            "'unknown', say what you searched and why the result is inconclusive. "
+            "Never claim a reachability level without evidence."
+        )
+
+    errors.extend(_validate_contextual_cvss(contextual_cvss_breakdown, contextual_cvss_reasoning))
+
+    advisory_err = _validate_advisory_cvss(advisory_cvss)
+    if advisory_err:
+        errors.append(advisory_err)
 
     if errors:
         return {"success": False, "error": "Validation failed", "errors": errors}
 
-    cvss_score, severity = _dependency_severity(advisory_cvss)
+    try:
+        cvss_score, severity, contextual_score, contextual_vector = _resolve_dependency_rating(
+            advisory_cvss, contextual_cvss_breakdown
+        )
+    except ValueError as exc:
+        return {"success": False, "error": "Validation failed", "errors": [str(exc)]}
     dependency_metadata = _build_dependency_metadata(
         package_name=package_name,
         installed_version=installed_version,
         package_ecosystem=package_ecosystem,
         fixed_version=fixed_version,
+        introduced_by=introduced_by,
+        dependency_path=dependency_path,
+        manifest_path=manifest_path,
+        reachability=reachability,
+        reachability_evidence=reachability_evidence,
+        advisory_cvss=advisory_cvss,
+        contextual_cvss_breakdown=contextual_cvss_breakdown,
+        contextual_cvss_score=contextual_score,
+        contextual_cvss_vector=contextual_vector,
+        contextual_cvss_reasoning=contextual_cvss_reasoning,
     )
     evidence = _build_dependency_evidence(
         cve=parsed_cve,
         package_name=package_name.strip(),
         installed_version=installed_version.strip(),
         fixed_version=fixed_version,
+        introduced_by=introduced_by,
+        dependency_path=dependency_path,
+        reachability=reachability,
+        reachability_evidence=reachability_evidence,
     )
 
     try:
@@ -837,10 +1122,17 @@ async def create_dependency_report(
     remediation_steps: str,
     assumptions: str,
     package_ecosystem: str,
+    manifest_path: str | None = None,
     fixed_version: str | None = None,
     cwe: str | None = None,
     technical_analysis: str | None = None,
     fix_effort: str = "low",
+    introduced_by: str | None = None,
+    dependency_path: str | None = None,
+    reachability: str = "unknown",
+    reachability_evidence: str | None = None,
+    contextual_cvss_breakdown: dict[str, str] | None = None,
+    contextual_cvss_reasoning: str | None = None,
 ) -> str:
     """File a known-CVE dependency (SCA) finding — one report per CVE x package.
 
@@ -865,9 +1157,28 @@ async def create_dependency_report(
     - Re-reporting the same CVE/package already filed.
 
     **Reachability**: do NOT silently downgrade or suppress a finding
-    because the vulnerable code path may be unreachable — instead state
-    reachability as an ``assumptions`` / confidence factor. Report the
-    finding; let the reader weigh exploitability.
+    because the vulnerable code path may be unreachable — report it, and
+    record what the usage analysis showed via the structured
+    ``reachability`` + ``reachability_evidence`` fields (see the
+    dependency-cve-scanning skill for the analysis procedure). The level
+    is an evidence ladder, never an exploitability verdict:
+
+    - ``not_imported`` — the package is never imported/required by
+      application code (strongest de-prioritization signal; still not
+      proof of safety — dynamic loading, reflection, or framework wiring
+      can evade static search).
+    - ``imported`` — application code imports the package, but usage of
+      the advisory's affected API was not confirmed.
+    - ``vulnerable_symbol_used`` — the advisory's affected
+      function/class/API appears in application code.
+    - ``reachable_call_path`` — a call-graph tool (e.g. ``govulncheck``)
+      proved a path from application code to the vulnerable function.
+    - ``unknown`` — usage analysis was not performed or was inconclusive.
+
+    Severity comes from ``contextual_cvss_breakdown`` when you provide one
+    (computed exactly like a normal finding's ``cvss_breakdown``), otherwise
+    from ``advisory_cvss``. The reachability level alone never changes the
+    rating, only prioritization.
 
     **Formatting**: use markdown in text fields (``**bold**``, ``inline
     code`` for package/version identifiers, fenced code blocks for
@@ -888,22 +1199,86 @@ async def create_dependency_report(
         cwe: ``CWE-NNN`` (most specific) if certain, else omit.
         advisory_cvss: **Required.** Published advisory base score
             (0.0-10.0) — read it off the advisory (trivy CVSS / NVD / GHSA).
-            Severity is derived solely from this score, so it must be the
-            real published value; do not guess or omit it.
+            It is the published reference the finding is rated against and
+            rates the finding whenever you give no contextual breakdown, so
+            it must be the real published value; do not guess or omit it.
         technical_analysis: Optional deeper mechanism/root-cause detail.
         fix_effort: One of ``trivial`` / ``low`` / ``medium`` / ``high``
             (dependency upgrades are usually ``trivial``/``low``).
+        introduced_by: For a **transitive** dependency, the direct
+            dependency (from the project's own manifest) that pulls the
+            vulnerable package in, as ``name@version`` (e.g.
+            ``express@4.18.1``). Omit when the vulnerable package is
+            itself a direct dependency.
+        dependency_path: The resolution chain from the direct dependency
+            to the vulnerable package, joined with `` > `` (e.g.
+            ``express@4.18.1 > body-parser@1.20.0 > qs@6.10.2``). Omit
+            for direct dependencies.
+        manifest_path: **Required.** The repo-relative path of the
+            lockfile/manifest where the vulnerable version was observed —
+            trivy's ``Target`` (e.g. ``package-lock.json``,
+            ``services/api/pom.xml``). Strip any scan-workspace or repo
+            checkout directory prefix so the path is relative to the
+            repository root. This binds the finding to its exact file so
+            remediation can target the right repository.
+        reachability: Usage-evidence level from static analysis — one of
+            ``not_imported`` / ``imported`` / ``vulnerable_symbol_used`` /
+            ``reachable_call_path`` / ``unknown``. Claim only what the
+            evidence proves; when in doubt use ``unknown``.
+        reachability_evidence: **Required.** The concrete proof for the
+            claimed level, or, for ``unknown``, what you searched and why
+            the result is inconclusive: repo-relative
+            ``file:line`` of the import or symbol usage, the matched
+            advisory symbols, or the govulncheck call-path excerpt.
+            Whenever you found the vulnerable symbol in use, also give the
+            **source-to-sink trace** here: start at the vulnerable package
+            call site and walk backwards hop by hop to the entry point
+            that carries untrusted input (HTTP route, CLI argument, queue
+            message, webhook, config file), going one step deeper whenever
+            a hop is a wrapper. Write it as ``entry point -> intermediate
+            call -> package call`` with a ``file:line`` per hop, name what
+            each hop enforces (auth, role check, validation, a flag that
+            is off in production), and say who controls the input. State
+            it plainly when no entry point reaches the sink — that is the
+            most useful result a reader can get.
+        contextual_cvss_breakdown: **Required.** Full CVSS v3.1 rating of this
+            CVE **in this codebase** — the same 8-metric object as
+            ``create_vulnerability_report``'s ``cvss_breakdown``:
+            ``attack_vector`` (N/A/L/P), ``attack_complexity`` (L/H),
+            ``privileges_required`` (N/L/H), ``user_interaction`` (N/R),
+            ``scope`` (U/C), ``confidentiality`` / ``integrity`` /
+            ``availability`` (N/L/H). All 8 metrics are required when the
+            field is set, and the contextual score/vector are computed
+            from them — you never supply a score. Start from the
+            advisory's published metrics and change only what the
+            **source-to-sink trace** you recorded in
+            ``reachability_evidence`` proves is different here: derive
+            ``attack_vector`` / ``privileges_required`` /
+            ``user_interaction`` from what the entry point actually
+            requires, ``attack_complexity`` from the preconditions the
+            hops enforce, and the impact metrics from the data and
+            privileges reachable at the sink. When provided, this rating
+            determines the finding's severity; ``advisory_cvss`` stays as
+            the published reference. Send it on every report: when the
+            trace does not change the published rating, or when you could
+            not complete the trace, repeat the advisory's own metrics and
+            adjust only what the usage level itself proves (a package the
+            code never imports is normally ``N`` on all three impact
+            metrics), then say so in the reasoning.
+        contextual_cvss_reasoning: **Required.** Two to four detailed
+            sentences that a reviewer can verify without opening the repo:
+            how the application uses the package, which call sites or
+            configuration you inspected (repo-relative ``file:line``),
+            which input reaches the vulnerable code and whether an
+            attacker controls it, and what the adjustment therefore
+            changes. State the source-to-sink chain explicitly, hop by
+            hop, as ``entry point -> intermediate call -> package call``
+            with a ``file:line`` for each hop. Cite concrete evidence,
+            never a generic statement such as "low risk". The user reads
+            this text next to the adjusted score, so an adjustment
+            without it is discarded.
     """
-    inner = ctx.context if isinstance(ctx.context, dict) else {}
-    raw_agent_id = inner.get("agent_id")
-    agent_id = raw_agent_id if isinstance(raw_agent_id, str) else None
-    agent_name = None
-    coordinator = inner.get("coordinator")
-    if agent_id is not None and coordinator is not None:
-        names = getattr(coordinator, "names", {})
-        if isinstance(names, dict):
-            raw_agent_name = names.get(agent_id)
-            agent_name = raw_agent_name if isinstance(raw_agent_name, str) else None
+    agent_id, agent_name = _caller_identity(ctx)
 
     result = await _do_create_dependency(
         title=title,
@@ -921,7 +1296,299 @@ async def create_dependency_report(
         advisory_cvss=advisory_cvss,
         technical_analysis=technical_analysis,
         fix_effort=fix_effort,
+        introduced_by=introduced_by,
+        dependency_path=dependency_path,
+        manifest_path=manifest_path,
+        reachability=reachability,
+        reachability_evidence=reachability_evidence,
+        contextual_cvss_breakdown=contextual_cvss_breakdown,
+        contextual_cvss_reasoning=contextual_cvss_reasoning,
         agent_id=agent_id,
         agent_name=agent_name,
     )
     return json.dumps(result, ensure_ascii=False, default=str)
+
+
+_SEVERITY_ORDER = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "info": 4,
+    "none": 5,
+}
+_VALID_SEVERITIES = frozenset(_SEVERITY_ORDER)
+_VALID_FINDING_CLASSES = frozenset({"dynamic", "dependency_cve"})
+_REPORT_DESCRIPTION_PREVIEW_CHARS = 280
+
+# Compact, listing-safe fields — no full bodies / PoC code / evidence.
+_REPORT_SUMMARY_FIELDS = (
+    "id",
+    "title",
+    "severity",
+    "cvss",
+    "finding_class",
+    "cve",
+    "cwe",
+    "target",
+    "endpoint",
+    "method",
+    "fix_effort",
+    "agent_name",
+    "timestamp",
+)
+
+
+def _report_severity_rank(report: dict[str, Any]) -> int:
+    return _SEVERITY_ORDER.get(str(report.get("severity", "")).lower(), 99)
+
+
+def _report_matches_filters(
+    report: dict[str, Any],
+    *,
+    severity: str | None,
+    finding_class: str | None,
+    target: str | None,
+    search: str | None,
+) -> bool:
+    if severity and str(report.get("severity", "")).lower() != severity:
+        return False
+    if finding_class and str(report.get("finding_class", "dynamic")).lower() != finding_class:
+        return False
+    if target:
+        target_lower = target.lower()
+        haystack = f"{report.get('target', '')} {report.get('endpoint', '')}".lower()
+        if target_lower not in haystack:
+            return False
+    if search:
+        search_lower = search.lower()
+        title_match = search_lower in str(report.get("title", "")).lower()
+        desc_match = search_lower in str(report.get("description", "")).lower()
+        if not (title_match or desc_match):
+            return False
+    return True
+
+
+def _mark_authorship(
+    entry: dict[str, Any], report: dict[str, Any], caller_agent_id: str | None
+) -> dict[str, Any]:
+    """Flag whether ``report`` was filed by the agent making this call."""
+    if caller_agent_id is not None and report.get("agent_id") == caller_agent_id:
+        entry["by_you"] = True
+    return entry
+
+
+def _to_report_summary_entry(
+    report: dict[str, Any], caller_agent_id: str | None = None
+) -> dict[str, Any]:
+    entry = {
+        field: report[field] for field in _REPORT_SUMMARY_FIELDS if report.get(field) is not None
+    }
+    description = str(report.get("description", "")).strip()
+    if description:
+        if len(description) > _REPORT_DESCRIPTION_PREVIEW_CHARS:
+            entry["description_preview"] = (
+                f"{description[:_REPORT_DESCRIPTION_PREVIEW_CHARS].rstrip()}..."
+            )
+        else:
+            entry["description_preview"] = description
+    return _mark_authorship(entry, report, caller_agent_id)
+
+
+def _severity_counts(reports: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for report in reports:
+        sev = str(report.get("severity", "")).lower() or "none"
+        counts[sev] = counts.get(sev, 0) + 1
+    return {sev: counts[sev] for sev in _SEVERITY_ORDER if sev in counts}
+
+
+async def _run_report_reader(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except (ImportError, AttributeError) as e:
+        logger.exception("report reader failed")
+        return {"success": False, "error": f"Failed to read reports: {e!s}"}
+
+
+def _do_list_reports(
+    *,
+    severity: str | None,
+    finding_class: str | None,
+    target: str | None,
+    search: str | None,
+    include_details: bool,
+    caller_agent_id: str | None = None,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    severity = (severity or "").strip().lower() or None
+    if severity and severity not in _VALID_SEVERITIES:
+        errors.append(
+            f"Invalid severity: {severity!r}. Must be one of: {sorted(_VALID_SEVERITIES)}"
+        )
+    finding_class = (finding_class or "").strip().lower() or None
+    if finding_class and finding_class not in _VALID_FINDING_CLASSES:
+        errors.append(
+            f"Invalid finding_class: {finding_class!r}. "
+            f"Must be one of: {sorted(_VALID_FINDING_CLASSES)}"
+        )
+    if errors:
+        return {"success": False, "error": "Validation failed", "errors": errors}
+
+    from strix.report.state import get_global_report_state
+
+    report_state = get_global_report_state()
+    if report_state is None:
+        return {
+            "success": True,
+            "reports": [],
+            "filtered_count": 0,
+            "total_count": 0,
+            "severity_counts": {},
+            "warning": "Report state unavailable - no reports have been filed yet",
+        }
+
+    all_reports = report_state.get_existing_vulnerabilities()
+    matched = [
+        r
+        for r in all_reports
+        if _report_matches_filters(
+            r,
+            severity=severity,
+            finding_class=finding_class,
+            target=(target or "").strip() or None,
+            search=(search or "").strip() or None,
+        )
+    ]
+    matched.sort(key=lambda r: (_report_severity_rank(r), str(r.get("id", ""))))
+
+    reports = [
+        _mark_authorship(dict(r), r, caller_agent_id)
+        if include_details
+        else _to_report_summary_entry(r, caller_agent_id)
+        for r in matched
+    ]
+    return {
+        "success": True,
+        "reports": reports,
+        "filtered_count": len(reports),
+        "total_count": len(all_reports),
+        "severity_counts": _severity_counts(all_reports),
+    }
+
+
+def _do_get_report(report_id: str, caller_agent_id: str | None = None) -> dict[str, Any]:
+    report_id = (report_id or "").strip()
+    if not report_id:
+        return {"success": False, "error": "report_id cannot be empty", "report": None}
+
+    from strix.report.state import get_global_report_state
+
+    report_state = get_global_report_state()
+    if report_state is None:
+        return {
+            "success": False,
+            "error": "Report state unavailable - no reports have been filed yet",
+            "report": None,
+        }
+
+    for report in report_state.get_existing_vulnerabilities():
+        if report.get("id") == report_id:
+            return {
+                "success": True,
+                "report": _mark_authorship(dict(report), report, caller_agent_id),
+            }
+    return {
+        "success": False,
+        "error": f"Report with id '{report_id}' not found",
+        "report": None,
+    }
+
+
+@function_tool(timeout=30)
+async def list_reports(
+    ctx: RunContextWrapper,
+    severity: str | None = None,
+    finding_class: str | None = None,
+    target: str | None = None,
+    search: str | None = None,
+    include_details: bool = False,
+) -> str:
+    """List vulnerability reports filed so far in this scan — metadata-first.
+
+    **For the orchestrator / root agent.** This is an orchestration tool
+    for tracking scan-wide coverage and assembling the final report — leaf
+    / specialist agents do their own testing and file findings; they should
+    NOT call this. If you are a subagent, ignore it and focus on your task.
+
+    Reports are shared across **every** agent in the scan, so this returns
+    findings filed by any agent (root or child), not just your own. As the
+    root agent, use it to track progress, avoid dispatching work on
+    already-covered ground, reason about attack-chaining across confirmed
+    findings, and build the ``finish_scan`` executive summary.
+
+    By default each entry is compact: ``id``, ``title``, ``severity``,
+    ``cvss``, ``finding_class``, ``cve`` / ``cwe``, ``target`` /
+    ``endpoint``, ``fix_effort``, ``agent_name`` (who filed it), ``timestamp``,
+    plus a 280-char ``description_preview``. Entries you filed yourself are
+    flagged ``by_you: true``. The response also carries
+    ``total_count`` and ``severity_counts`` (counts per severity across all
+    reports, ignoring filters). Set ``include_details=True`` for full report
+    bodies (PoC, evidence, remediation, code_locations) — token-expensive;
+    prefer ``get_report`` to drill into a single finding.
+
+    Filters compose (all must match): ``severity`` and ``finding_class``
+    match exactly, ``target`` is a substring match against target/endpoint,
+    and ``search`` is a substring match against title/description. Results
+    are ordered by severity (critical -> info), then report id.
+
+    This is read-only — it never files or dedupes anything.
+
+    Args:
+        severity: Filter to one of ``critical`` / ``high`` / ``medium`` /
+            ``low`` / ``info`` / ``none``.
+        finding_class: Filter to ``dynamic`` (PoC-backed) or
+            ``dependency_cve`` (known-CVE supply-chain).
+        target: Substring match against a report's target / endpoint.
+        search: Substring match against title and description.
+        include_details: When False (default) entries are compact; when
+            True full report bodies are returned.
+    """
+    caller_agent_id, _ = _caller_identity(ctx)
+    return json.dumps(
+        await _run_report_reader(
+            _do_list_reports,
+            severity=severity,
+            finding_class=finding_class,
+            target=target,
+            search=search,
+            include_details=include_details,
+            caller_agent_id=caller_agent_id,
+        ),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+@function_tool(timeout=30)
+async def get_report(ctx: RunContextWrapper, report_id: str) -> str:
+    """Fetch one vulnerability report by its id (e.g. ``vuln-0001``).
+
+    Returns the full report body — description, impact, technical analysis,
+    PoC, evidence, remediation, CVSS breakdown, and any ``code_locations``.
+    Use ``list_reports`` first to find ids; this is the cheap way to read a
+    single finding in full without pulling every body.
+
+    Read-only.
+
+    Args:
+        report_id: Report id from ``list_reports`` or a
+            ``create_vulnerability_report`` / ``create_dependency_report``
+            response (format ``vuln-NNNN``).
+    """
+    caller_agent_id, _ = _caller_identity(ctx)
+    return json.dumps(
+        await _run_report_reader(_do_get_report, report_id, caller_agent_id),
+        ensure_ascii=False,
+        default=str,
+    )

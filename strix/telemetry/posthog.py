@@ -1,11 +1,11 @@
-import json
 import logging
-import urllib.request
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
+
+import requests
 
 from strix.config import load_settings
 from strix.telemetry._common import (
+    SEND_TIMEOUT,
     SESSION_ID,
     base_props,
     is_first_run,
@@ -37,12 +37,7 @@ def _send(event: str, properties: dict[str, Any]) -> bool:
             "distinct_id": SESSION_ID,
             "properties": properties,
         }
-        req = urllib.request.Request(  # noqa: S310
-            f"{_POSTHOG_HOST}/capture/",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10):  # noqa: S310  # nosec B310
+        with requests.post(f"{_POSTHOG_HOST}/capture/", json=payload, timeout=SEND_TIMEOUT):
             pass
     except Exception:  # noqa: BLE001
         logger.debug("posthog send failed for event %s", event, exc_info=True)
@@ -58,12 +53,14 @@ def start(
     is_whitebox: bool,
     interactive: bool,
     has_instructions: bool,
+    auth_mode: str | None = None,
 ) -> None:
     _send(
         "scan_started",
         {
             **base_props(),
             "model": model or "unknown",
+            "auth_mode": auth_mode or "api_key",
             "scan_mode": scan_mode or "unknown",
             "scan_type": "whitebox" if is_whitebox else "blackbox",
             "interactive": interactive,
@@ -107,17 +104,11 @@ def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
         if sev in vulnerabilities_counts:
             vulnerabilities_counts[sev] += 1
 
-    duration = 0.0
-    try:
-        start = datetime.fromisoformat(report_state.start_time.replace("Z", "+00:00"))
-        end_iso = report_state.end_time or datetime.now(start.tzinfo).isoformat()
-        duration = (datetime.fromisoformat(end_iso.replace("Z", "+00:00")) - start).total_seconds()
-    except (ValueError, TypeError, AttributeError):
-        pass
+    duration = report_state.get_process_duration_seconds()
 
     llm_props: dict[str, int | float] = {}
     try:
-        usage = report_state.get_total_llm_usage()
+        usage = report_state.get_process_llm_usage()
         if isinstance(usage, dict):
             llm_props = {
                 "llm_requests": int(usage.get("requests") or 0),
@@ -133,6 +124,7 @@ def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
         "scan_ended",
         {
             **base_props(),
+            "auth_mode": report_state.run_record.get("auth_mode") or "api_key",
             "exit_reason": report_state.scan_ended_exit_reason,
             "duration_seconds": round(duration),
             "vulnerabilities_total": len(report_state.vulnerability_reports),
@@ -140,6 +132,52 @@ def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
             **llm_props,
         },
     )
+
+
+def viewer_opened(source: str, live: bool) -> None:
+    _send(
+        "viewer_opened",
+        {
+            **base_props(),
+            "source": source,
+            "live": live,
+        },
+    )
+
+
+def viewer_cta_clicked(cta: str, surface: str | None = None) -> None:
+    props = {
+        **base_props(),
+        "cta": cta[:64],
+    }
+    if surface:
+        props["surface"] = surface[:64]
+    _send("viewer_cta_clicked", props)
+
+
+_VIEWER_EMAIL_STEPS = frozenset(
+    {"email_submitted", "email_verified", "report_sent", "work_email_required"}
+)
+
+
+def viewer_email_event(step: str, purpose: str | None = None) -> None:
+    if step not in _VIEWER_EMAIL_STEPS:
+        return
+    _send(
+        f"viewer_{step}",
+        {
+            **base_props(),
+            **({"purpose": purpose} if purpose else {}),
+        },
+    )
+
+
+def viewer_feedback_submitted() -> None:
+    _send("viewer_feedback_submitted", {**base_props()})
+
+
+def viewer_agent_steered() -> None:
+    _send("viewer_agent_steered", {**base_props()})
 
 
 def error(error_type: str) -> None:

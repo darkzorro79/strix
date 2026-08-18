@@ -11,12 +11,14 @@ from typing import Any
 
 import httpx
 import pytest
+from agents import ModelSettings
 from openai import RateLimitError
 
 import strix.tools.notes.tools as notes_tools
 import strix.tools.todo.tools as todo_tools
 from strix.core import runner
 from strix.core.agents import AgentCoordinator
+from strix.runtime import session_manager
 
 
 def _make_rate_limit_error() -> RateLimitError:
@@ -45,7 +47,11 @@ def _patch_engine_scaffold(
             model="openai/gpt-4o",
             reasoning_effort="high",
             force_required_tool_choice=False,
-        )
+            timeout=300,
+            prompt_cache=True,
+            extra_headers=None,
+        ),
+        runtime=types.SimpleNamespace(max_context_images=3),
     )
     monkeypatch.setattr(runner, "load_settings", lambda: settings)
     monkeypatch.setattr(runner, "configure_sdk_model_defaults", lambda _settings: None)
@@ -64,12 +70,12 @@ def _patch_engine_scaffold(
     async def _cleanup(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr(runner.session_manager, "create_or_reuse", _create_or_reuse)
-    monkeypatch.setattr(runner.session_manager, "cleanup", _cleanup)
+    monkeypatch.setattr(session_manager, "create_or_reuse", _create_or_reuse)
+    monkeypatch.setattr(session_manager, "cleanup", _cleanup)
 
     monkeypatch.setattr(runner, "build_root_task", lambda _scan_config: "task")
     monkeypatch.setattr(runner, "build_scope_context", lambda _scan_config: scope_context)
-    monkeypatch.setattr(runner, "make_model_settings", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner, "make_model_settings", lambda *_args, **_kwargs: ModelSettings())
 
     captured: dict[str, Any] = {}
 
@@ -82,7 +88,8 @@ def _patch_engine_scaffold(
     monkeypatch.setattr(runner, "make_child_factory", lambda **_kwargs: lambda **_k: object())
     monkeypatch.setattr(runner, "open_agent_session", lambda _root_id, _db: object())
 
-    async def _raise_rate_limit(*_args: Any, **_kwargs: Any) -> None:
+    async def _raise_rate_limit(*_args: Any, **kwargs: Any) -> None:
+        captured["run_config"] = kwargs.get("run_config")
         raise _make_rate_limit_error()
 
     monkeypatch.setattr(runner, "run_agent_loop", _raise_rate_limit)
@@ -124,8 +131,7 @@ async def test_root_prompt_options_flow_into_root_agent(
     assert "https://example.com" in instructions_override
     assert "CUSTOM SCAN PROMPT" in instructions_override
     assert (
-        "cannot expand, replace, or weaken authorized target constraints"
-        in instructions_override
+        "cannot expand, replace, or weaken authorized target constraints" in instructions_override
     )
     assert kwargs["system_prompt_context"] == {
         **scope_context,
@@ -172,3 +178,21 @@ async def test_root_prompt_options_default_to_none(
     kwargs = captured["kwargs"]
     assert kwargs["instructions_override"] is None
     assert kwargs["system_prompt_context"] == {"scope": "built-in"}
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_calls_are_returned_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A hallucinated tool name must not end the scan."""
+    captured = _patch_engine_scaffold(monkeypatch, tmp_path, {})
+
+    await runner.run_strix_scan(
+        scan_config={"targets": [], "scan_mode": "deep"},
+        scan_id="scan-unknown-tool",
+        image="img",
+        coordinator=AgentCoordinator(),
+    )
+
+    assert captured["run_config"].tool_not_found_behavior == "return_error_to_model"
