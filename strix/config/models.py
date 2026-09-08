@@ -18,7 +18,7 @@ from agents import (
 )
 from agents.model_settings import ModelSettings
 from agents.models.fake_id import FAKE_RESPONSES_ID
-from agents.models.interface import Model
+from agents.models.interface import Model, ModelProvider
 from agents.models.multi_provider import MultiProvider
 from agents.models.openai_responses import OpenAIResponsesModel
 from agents.retry import (
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from agents.agent_output import AgentOutputSchemaBase
     from agents.handoffs import Handoff
     from agents.items import ModelResponse, TResponseInputItem, TResponseStreamEvent
-    from agents.models.interface import ModelProvider, ModelTracing
+    from agents.models.interface import ModelTracing
     from agents.retry import ModelRetryAdvice, ModelRetryAdviceRequest
     from agents.tool import Tool
     from agents.usage import Usage
@@ -445,11 +445,60 @@ def _response_usage(usage: Usage | None) -> ResponseUsage | None:
     )
 
 
+class _CredentialedLitellmProvider(ModelProvider):
+    """LiteLLM route bound to one endpoint's credentials.
+
+    ``LitellmProvider`` reads them from the process-wide LiteLLM globals, which
+    belong to the main model; a secondary endpoint needs its own.
+    """
+
+    def __init__(self, api_key: str | None, base_url: str | None) -> None:
+        self._api_key = api_key
+        self._base_url = base_url
+
+    def get_model(self, model_name: str | None) -> Model:
+        from agents.extensions.models.litellm_model import LitellmModel
+        from agents.models.default_models import get_default_model
+
+        return LitellmModel(
+            model=model_name or get_default_model(),
+            api_key=self._api_key,
+            base_url=self._base_url,
+        )
+
+
 class StrixProvider(MultiProvider):
     """Route any non-OpenAI prefix through LiteLLM with the prefix preserved,
     so users type ``deepseek/deepseek-chat`` rather than
     ``litellm/deepseek/deepseek-chat``.
+
+    ``api_key``/``base_url`` bind every route this provider resolves to one
+    endpoint, for a secondary model (the dedupe judge) whose endpoint differs
+    from the main model's process-wide defaults.
     """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            openai_api_key=api_key,
+            openai_base_url=base_url,
+            # A custom endpoint is OpenAI-compatible, i.e. chat completions; the
+            # global default is the main model's and may say otherwise.
+            openai_use_responses=False if base_url else None,
+            **kwargs,
+        )
+        self._override_api_key = api_key
+        self._override_base_url = base_url
+
+    def _create_fallback_provider(self, prefix: str) -> ModelProvider:
+        if prefix == "litellm" and (self._override_api_key or self._override_base_url):
+            return _CredentialedLitellmProvider(self._override_api_key, self._override_base_url)
+        return super()._create_fallback_provider(prefix)
 
     def _resolve_prefixed_model(
         self,
@@ -513,6 +562,8 @@ DEFAULT_MODEL_RETRY = ModelRetrySettings(
 )
 
 RECOMMENDED_MODEL_NAMES = (
+    "zai/glm-5.3",
+    "zai/glm-5.3-flash",
     "openai/gpt-5.6-sol",
     "openai/gpt-5.6-terra",
     "openai/gpt-5.6-luna",
@@ -521,6 +572,7 @@ RECOMMENDED_MODEL_NAMES = (
     "openai/gpt-5.5",
     "openai/gpt-5.4",
     "openai/gpt-5.3-codex",
+    "anthropic/claude-fable-5-1",
     "anthropic/claude-fable-5",
     "anthropic/claude-opus-5",
     "anthropic/claude-opus-4-8",
@@ -528,6 +580,8 @@ RECOMMENDED_MODEL_NAMES = (
     "anthropic/claude-sonnet-4-6",
     "vertex_ai/gemini-3.1-pro-preview",
     "gemini/gemini-3.1-pro-preview",
+    "vertex_ai/gemini-3.7-flash",
+    "gemini/gemini-3.7-flash",
     "gemini/gemini-3.6-flash",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
@@ -539,16 +593,27 @@ RECOMMENDED_MODEL_NAMES = (
 
 _RECOMMENDED_MODEL_NAME_SET = frozenset(name.lower() for name in RECOMMENDED_MODEL_NAMES)
 
-FRONTIER_MODEL_FAMILIES = (
-    (("azure", "azure_ai", "bedrock_mantle", "chatgpt", "openai"), ("gpt-5",)),
-    (
-        ("anthropic", "azure_ai", "bedrock", "claude", "databricks", "snowflake", "vertex_ai"),
-        ("claude-fable-5", "claude-opus-5", "claude-opus-4", "claude-sonnet-5", "claude-sonnet-4"),
-    ),
-    (("google", "gemini", "vertex_ai"), ("gemini-3",)),
-    (("deepseek",), ("deepseek-v4", "deepseek-r1", "deepseek-reasoner")),
-    (("alibaba", "dashscope", "qwen"), ("qwen3.8", "qwen3.7", "qwen3-max")),
-    (("moonshot", "moonshotai", "kimi"), ("kimi-k3", "kimi-k2.7", "kimi-k2.6")),
+# Matched against the bare model name only: the route (``openai/``, ``openrouter/``,
+# a local gateway, ...) says nothing about the model's quality.
+FRONTIER_MODEL_PREFIXES = (
+    "gpt-5",
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4",
+    "claude-sonnet-5",
+    "claude-sonnet-4",
+    "gemini-3",
+    "deepseek-v4",
+    "deepseek-r1",
+    "deepseek-reasoner",
+    "qwen3.8",
+    "qwen3.7",
+    "qwen3-max",
+    "kimi-k3",
+    "kimi-k2.7",
+    "kimi-k2.6",
+    "glm-5.3",
+    "glm-5.2",
 )
 
 
@@ -749,6 +814,18 @@ def uses_chat_completions_tool_schema(model_name: str, settings: Settings) -> bo
     return not model_supports_reasoning(model_name)
 
 
+def supports_strict_tool_schemas(model_name: str) -> bool:
+    """Return whether the route accepts strict tool schemas for Strix's toolset.
+
+    Claude caps a request at 20 strict tools and 16 union-typed parameters
+    across all strict schemas. Strix ships ~30 tools and the strict dialect
+    turns every optional parameter into a nullable union, so both caps are
+    exceeded and the request is rejected outright.
+    """
+    name = model_name.strip().lower()
+    return not any(marker in name for marker in _ANTHROPIC_MODEL_MARKERS)
+
+
 def model_supports_reasoning(model_name: str) -> bool:
     import litellm
 
@@ -770,11 +847,8 @@ def is_recommended_or_frontier_model(model_name: str) -> bool:
         return False
     if name in _RECOMMENDED_MODEL_NAME_SET:
         return True
-    provider_name, bare_model_name = _split_model_provider(name)
-    return any(
-        _matches_frontier_family(provider_name, bare_model_name, provider_markers, prefixes)
-        for provider_markers, prefixes in FRONTIER_MODEL_FAMILIES
-    )
+    bare_model_name = name.rsplit("/", 1)[-1]
+    return _matches_model_prefix(bare_model_name, FRONTIER_MODEL_PREFIXES)
 
 
 def _normalized_model_name(model_name: str) -> str:
@@ -784,28 +858,6 @@ def _normalized_model_name(model_name: str) -> str:
             name = name[len(prefix) :]
             break
     return name
-
-
-def _split_model_provider(model_name: str) -> tuple[str | None, str]:
-    if "/" not in model_name:
-        return None, model_name
-    provider_name, bare_model_name = model_name.rsplit("/", 1)
-    return provider_name, bare_model_name
-
-
-def _matches_frontier_family(
-    provider_name: str | None,
-    model_name: str,
-    provider_markers: tuple[str, ...],
-    model_prefixes: tuple[str, ...],
-) -> bool:
-    if not _matches_model_prefix(model_name, model_prefixes):
-        return False
-    if provider_name is None:
-        return True
-    return _contains_provider_marker(
-        provider_name, provider_markers, split_compound_names=True
-    ) or _contains_provider_marker(model_name, provider_markers)
 
 
 def _matches_model_prefix(model_name: str, model_prefixes: tuple[str, ...]) -> bool:
@@ -825,16 +877,6 @@ def _model_name_candidates(model_name: str) -> tuple[str, ...]:
     return (model_name, *suffixes)
 
 
-def _contains_provider_marker(
-    value: str, provider_markers: tuple[str, ...], *, split_compound_names: bool = False
-) -> bool:
-    parts = set(value.replace(".", "/").split("/"))
-    if split_compound_names:
-        for separator in ("_", "-"):
-            parts.update(piece for part in tuple(parts) for piece in part.split(separator))
-    return any(marker in parts for marker in provider_markers)
-
-
 def is_known_openai_bare_model(model_name: str) -> bool:
     import litellm
 
@@ -845,8 +887,27 @@ def is_known_openai_bare_model(model_name: str) -> bool:
     return bool(entry and entry.get("litellm_provider") == "openai")
 
 
+_ANTHROPIC_MODEL_MARKERS = ("anthropic", "claude", "sonnet", "opus", "haiku")
+
+
 def is_claude_model(model_name: str) -> bool:
     return "claude" in (model_name or "").strip().lower()
+
+
+def routes_through_litellm(model_name: str | None) -> bool:
+    """Whether :class:`StrixProvider` sends this model through LiteLLM.
+
+    Bare names and the ``openai/``/``any-llm/`` prefixes are served by the SDK's
+    own clients, which raise ``TypeError`` on request fields they do not know,
+    so LiteLLM-only fields must not be attached there. A bare ``claude-...``
+    name is exactly that case: an ``LLM_API_BASE`` pointing at an
+    OpenAI-compatible gateway in front of Claude.
+    """
+    name = (model_name or "").strip()
+    if not name or codex.subscription_model(name):
+        return False
+    prefix, _, rest = name.partition("/")
+    return bool(rest) and prefix.lower() not in {"openai", "any-llm"}
 
 
 def is_bedrock_route(model_name: str) -> bool:
