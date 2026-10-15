@@ -8,7 +8,7 @@ import io
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -203,7 +203,7 @@ async def run_strix_scan(
     scan_id: str | None = None,
     image: str,
     local_sources: list[dict[str, Any]] | None = None,
-    extra_files: list[dict[str, Any]] | None = None,
+    extra_files: list[dict[str, Any]] | Awaitable[list[dict[str, Any]] | None] | None = None,
     coordinator: AgentCoordinator | None = None,
     interactive: bool = False,
     max_turns: int = DEFAULT_MAX_TURNS,
@@ -401,6 +401,7 @@ async def run_strix_scan(
             request_timeout=settings.llm.timeout,
             prompt_cache=settings.llm.prompt_cache,
             extra_headers=settings.llm.extra_headers,
+            extra_body=settings.llm.extra_body,
         )
         run_config = RunConfig(
             model=resolved_model,
