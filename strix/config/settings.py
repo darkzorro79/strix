@@ -65,6 +65,10 @@ class LlmSettings(BaseSettings):
         default=False,
         alias="STRIX_FORCE_REQUIRED_TOOL_CHOICE",
     )
+    parallel_tool_calls: bool = Field(
+        default=False,
+        alias="STRIX_PARALLEL_TOOL_CALLS",
+    )
     prompt_cache: bool = Field(
         default=True,
         alias="STRIX_PROMPT_CACHE",
@@ -163,6 +167,7 @@ class TelemetrySettings(BaseSettings):
     model_config = _BASE_CONFIG
 
     enabled: bool = Field(default=True, alias="STRIX_TELEMETRY")
+    run_record_timings: bool = Field(default=False, alias="STRIX_RUN_RECORD_TIMINGS")
 
 
 WebSearchProvider = Literal["auto", "perplexity", "exa"]
