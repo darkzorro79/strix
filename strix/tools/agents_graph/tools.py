@@ -311,8 +311,8 @@ async def wait_for_agents(  # noqa: PLR0911
     **This tool is only for waiting on other agents.** Two things it is
     NOT for:
 
-    - **Talking to the user.** Use ``respond_to_user``, which delivers
-      your message and hands control back in one call.
+    - **Waiting for the user.** Write your reply as plain text, then call
+      ``wait_for_user`` to hand control back.
     - **Waiting for a long-running command.** This tool does not watch
       processes at all — it sleeps until a *message* arrives, so it
       burns the full timeout even if your command finished a second
@@ -535,9 +535,8 @@ async def create_agent(
             success looks like, any constraints. Name the target the
             child should call ``get_threat_model`` on, and any shared
             state it should build on rather than rediscover — what
-            recon already mapped, which surfaces are already covered,
-            which coverage entry it is picking up. A child that is not
-            told what is already known repeats it.
+            recon already mapped, which surfaces are already covered.
+            A child that is not told what is already known repeats it.
         inherit_context: Default ``True``. The child receives the
             parent's input history as background; only set ``False``
             when starting a clean-slate task.
@@ -637,9 +636,8 @@ async def agent_finish(
     doing: what did you test, what did you find/confirm/rule out,
     what's still open.
 
-    **Close out honestly.** Before calling this, every surface you
-    assessed should have a ``record_coverage`` entry, and anything you
-    could neither confirm nor rule out belongs in ``open_items`` — an
+    **Close out honestly.** Before calling this, anything you could
+    neither confirm nor rule out belongs in ``open_items`` — an
     unresolved candidate handed up to the parent is useful, a silently
     dropped one is a missed vulnerability. Reporting nothing and
     listing no open items asserts the area is clean; only say that if
@@ -683,7 +681,8 @@ async def agent_finish(
             {
                 "success": False,
                 "error": (
-                    "agent_finish is for subagents. Root/main agents must call finish_scan instead"
+                    "agent_finish is for subagents. Root/main agents must call "
+                    f"{coordinator.root_finish_tool} instead"
                 ),
             },
             ensure_ascii=False,

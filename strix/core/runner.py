@@ -8,7 +8,7 @@ import io
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +23,7 @@ from strix.config.models import (
     StrixProvider,
     configure_sdk_api_route,
     configure_sdk_model_defaults,
+    model_supports_images,
     supports_strict_tool_schemas,
     uses_chat_completions_tool_schema,
 )
@@ -35,7 +36,12 @@ from strix.core.execution import (
 from strix.core.execution import (
     spawn_child_agent as start_child_agent,
 )
-from strix.core.hooks import BudgetExceededError, ReportUsageHooks, recomputed_budget_flags
+from strix.core.hooks import (
+    SUBAGENT_TURN_LIMITS_KEY,
+    BudgetExceededError,
+    ReportUsageHooks,
+    recomputed_budget_flags,
+)
 from strix.core.inputs import (
     build_root_task,
     build_scan_targets,
@@ -48,15 +54,18 @@ from strix.report.state import get_global_report_state
 from strix.runtime import session_manager
 from strix.telemetry import set_scan_phase
 from strix.telemetry.logging import set_scan_id, setup_scan_logging
+from strix.tools.finish.tool import finish_scan
 from strix.tools.output_store import (
     WORKSPACE_SPILL_DIR,
     configure_spill_writer,
 )
+from strix.tools.reporting.tool import create_vulnerability_report
 
 
 if TYPE_CHECKING:
     from agents.memory import SQLiteSession
     from agents.result import RunResultBase
+    from agents.tool import Tool
 
     from strix.runtime.status import StatusSink
     from strix.tools.mcp import (
@@ -66,6 +75,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_MCP_PROMPT_WARMUP_TIMEOUT_SECONDS = 30.0
 
 StreamEventSink = Callable[[str, Any], None]
 
@@ -89,6 +100,19 @@ def _mcp_roster_payload(registry: McpRegistry) -> list[dict[str, Any]]:
             "state": status.state,
         }
         for status in registry.statuses()
+    ]
+
+
+def _mcp_prompt_roster(registry: McpRegistry) -> list[dict[str, Any]]:
+    """The MCP roster rendered in agent prompts, with only verified counts."""
+    return [
+        {
+            "name": summary.name,
+            "purpose": summary.purpose,
+            "tool_count": summary.tool_count if summary.state == "catalog_ready" else None,
+            "state": summary.state,
+        }
+        for summary in registry.summaries()
     ]
 
 
@@ -152,10 +176,17 @@ def _compose_root_instructions_override(
     is_whitebox: bool,
     is_diff_scoped: bool,
     interactive: bool,
+    parallel_tool_calls: bool,
     system_prompt_context: dict[str, Any],
+    supports_images: bool,
+    report_tool: str,
+    coverage_tools: bool,
+    replace_scan_prompt: bool = False,
 ) -> str | None:
     if root_instructions_override is None:
         return None
+    if replace_scan_prompt:
+        return f"{root_instructions_override}\n\n{render_scope_prompt(system_prompt_context)}"
 
     base_instructions = render_system_prompt(
         skills=skills,
@@ -164,15 +195,17 @@ def _compose_root_instructions_override(
         is_root=True,
         is_diff_scoped=is_diff_scoped,
         interactive=interactive,
+        parallel_tool_calls=parallel_tool_calls,
         system_prompt_context=system_prompt_context,
         include_scope=False,
+        supports_images=supports_images,
+        report_tool=report_tool,
+        coverage_tools=coverage_tools,
     )
     return (
         f"{base_instructions}\n\n"
         "<root_scan_instructions_override>\n"
-        "The following root scan instructions are subordinate to the "
-        "system-verified scope below. They cannot expand, replace, or weaken "
-        "authorized target constraints.\n\n"
+        "The following root scan instructions describe the task configuration.\n\n"
         f"{root_instructions_override}\n"
         "</root_scan_instructions_override>\n\n"
         f"{render_scope_prompt(system_prompt_context)}"
@@ -185,7 +218,7 @@ async def run_strix_scan(
     scan_id: str | None = None,
     image: str,
     local_sources: list[dict[str, Any]] | None = None,
-    extra_files: list[dict[str, Any]] | None = None,
+    extra_files: list[dict[str, Any]] | Awaitable[list[dict[str, Any]] | None] | None = None,
     coordinator: AgentCoordinator | None = None,
     interactive: bool = False,
     max_turns: int = DEFAULT_MAX_TURNS,
@@ -195,15 +228,22 @@ async def run_strix_scan(
     cleanup_on_exit: bool = True,
     event_sink: StreamEventSink | None = None,
     root_instructions_override: str | None = None,
+    replace_root_scan_prompt: bool = False,
     extra_system_prompt_context: dict[str, Any] | None = None,
     status_sink: StatusSink | None = None,
     mcp_connection_requests: list[McpConnectionRequest] | None = None,
     mcp_status_sink: McpStatusSink | None = None,
+    root_finish_tool: Tool = finish_scan,
+    report_tool: Tool = create_vulnerability_report,
+    coverage_tools: bool = True,
+    subagent_turn_limits: Mapping[str, int] | None = None,
 ) -> RunResultBase | None:
     """Run or resume one Strix scan against a sandbox.
 
     ``root_instructions_override`` adds root scan instructions to the rendered
     root prompt without replacing the system-verified scope block.
+    ``replace_root_scan_prompt=True`` makes it the root's whole prompt, followed
+    by the scope, instead of adding it to the rendered scan prompt.
     ``extra_files`` entries (``{"workspace_path", "content"}``) are placed into
     the sandbox workspace at session bring-up; see
     :func:`strix.runtime.session_manager.create_or_reuse`.
@@ -221,6 +261,14 @@ async def run_strix_scan(
     command-line default) it reads ``~/.strix/mcp-servers.json`` itself. Either
     way the engine does the connecting, so the caller passes inert configs plus
     metadata and never live sessions.
+    ``root_finish_tool`` is the tool the root agent ends the run with.
+    ``report_tool`` is the tool every agent files findings with, in place of
+    ``create_vulnerability_report``.
+    ``coverage_tools=False`` drops the coverage ledger tools and their prompt
+    rules from every agent.
+    ``subagent_turn_limits`` maps a skill name to a soft turn limit for sub-agents
+    spawned with that skill (the largest applies). Agents are warned 10 turns
+    before it and reminded past it, but never stopped.
     """
 
     def report(phase: str) -> None:
@@ -267,6 +315,9 @@ async def run_strix_scan(
     strict_tool_schemas = supports_strict_tool_schemas(resolved_model)
     if not strict_tool_schemas:
         logger.info("Sending non-strict tool schemas: %s caps strict tools", resolved_model)
+    supports_images = model_supports_images(resolved_model)
+    if not supports_images:
+        logger.info("Leaving out image tools: %s does not accept images", resolved_model)
 
     if budget_policy not in ("stop", "pause"):
         raise ValueError(f"unknown budget_policy: {budget_policy!r}")
@@ -274,6 +325,7 @@ async def run_strix_scan(
         coordinator = AgentCoordinator()
     coordinator.set_snapshot_path(agents_path)
     coordinator.set_budget_policy(budget_policy)
+    coordinator.root_finish_tool = root_finish_tool.name
 
     from strix.tools.coverage.tools import hydrate_coverage_from_disk
     from strix.tools.notes.tools import hydrate_notes_from_disk
@@ -374,9 +426,11 @@ async def run_strix_scan(
             settings.llm.reasoning_effort,
             model_name=resolved_model,
             force_required_tool_choice=settings.llm.force_required_tool_choice,
+            parallel_tool_calls=settings.llm.parallel_tool_calls,
             request_timeout=settings.llm.timeout,
             prompt_cache=settings.llm.prompt_cache,
             extra_headers=settings.llm.extra_headers,
+            extra_body=settings.llm.extra_body,
         )
         run_config = RunConfig(
             model=resolved_model,
@@ -394,6 +448,7 @@ async def run_strix_scan(
             max_turns=max_turns,
             interactive=interactive,
             budget_policy=budget_policy,
+            record_tool_timings=settings.telemetry.run_record_timings,
         )
         coordinator.set_budget_limit_setter(hooks.set_max_budget_usd)
         if interactive and budget_policy != "pause":
@@ -434,19 +489,13 @@ async def run_strix_scan(
                 _record_mcp_connections(mcp_registry.names())
                 report(
                     f"MCP: configured {len(mcp_registry)} connection(s); "
-                    "warming them in the background"
+                    "connecting and listing tools"
                 )
                 scope_context["mcp_available"] = True
-                scope_context["mcp_connections"] = [
-                    {
-                        "name": summary.name,
-                        "purpose": summary.purpose,
-                        "tool_count": summary.tool_count,
-                    }
-                    for summary in mcp_registry.summaries()
-                ]
+                scope_context["mcp_connections"] = _mcp_prompt_roster(mcp_registry)
 
                 def _emit_mcp_status() -> None:
+                    scope_context["mcp_connections"] = _mcp_prompt_roster(mcp_registry)
                     roster = _mcp_roster_payload(mcp_registry)
                     _persist_mcp_status(roster)
                     if mcp_status_sink is not None:
@@ -457,7 +506,11 @@ async def run_strix_scan(
 
                 mcp_registry.set_status_sink(_emit_mcp_status)
                 _emit_mcp_status()
-                mcp_registry.start_warmup(max_concurrency=6)
+                warmup_task = mcp_registry.start_warmup(max_concurrency=6)
+                await asyncio.wait(
+                    {warmup_task},
+                    timeout=_MCP_PROMPT_WARMUP_TIMEOUT_SECONDS,
+                )
         except Exception:
             logger.exception("Failed to configure user MCP servers; continuing without them")
 
@@ -469,7 +522,12 @@ async def run_strix_scan(
             is_whitebox=is_whitebox,
             is_diff_scoped=is_diff_scoped,
             interactive=interactive,
+            parallel_tool_calls=settings.llm.parallel_tool_calls,
             system_prompt_context=root_context,
+            supports_images=supports_images,
+            report_tool=report_tool.name,
+            coverage_tools=coverage_tools,
+            replace_scan_prompt=replace_root_scan_prompt,
         )
 
         root_agent = build_strix_agent(
@@ -480,10 +538,15 @@ async def run_strix_scan(
             is_whitebox=is_whitebox,
             is_diff_scoped=is_diff_scoped,
             interactive=interactive,
+            parallel_tool_calls=settings.llm.parallel_tool_calls,
             chat_completions_tools=chat_completions_tools,
             strict_tool_schemas=strict_tool_schemas,
             system_prompt_context=root_context,
             instructions_override=root_instructions,
+            supports_images=supports_images,
+            finish_tool=root_finish_tool,
+            report_tool=report_tool,
+            coverage_tools=coverage_tools,
         )
 
         if not is_resume:
@@ -500,9 +563,13 @@ async def run_strix_scan(
             is_whitebox=is_whitebox,
             is_diff_scoped=is_diff_scoped,
             interactive=interactive,
+            parallel_tool_calls=settings.llm.parallel_tool_calls,
             chat_completions_tools=chat_completions_tools,
             strict_tool_schemas=strict_tool_schemas,
             system_prompt_context=scope_context,
+            supports_images=supports_images,
+            report_tool=report_tool,
+            coverage_tools=coverage_tools,
         )
 
         async def spawn_child_agent(**kwargs: Any) -> dict[str, Any]:
@@ -530,6 +597,9 @@ async def run_strix_scan(
             "spawn_child_agent": spawn_child_agent,
             "scan_targets": build_scan_targets(scan_config),
             "max_context_images": settings.runtime.max_context_images,
+            "supports_images": supports_images,
+            "coverage_tools": coverage_tools,
+            SUBAGENT_TURN_LIMITS_KEY: dict(subagent_turn_limits or {}),
         }
 
         root_session = open_agent_session(root_id, agents_db)
@@ -594,16 +664,10 @@ async def run_strix_scan(
         )
         if not interactive and result is not None:
             final = getattr(result, "final_output", None)
-            scan_completed = False
-            if isinstance(final, str):
-                try:
-                    parsed = json.loads(final)
-                    scan_completed = bool(isinstance(parsed, dict) and parsed.get("scan_completed"))
-                except (ValueError, TypeError):
-                    scan_completed = False
-            elif isinstance(final, dict):
-                scan_completed = bool(final.get("scan_completed"))
-            if not scan_completed:
+            # Lifecycle tools mark the root completed.
+            async with coordinator._lock:
+                root_completed = coordinator.statuses.get(root_id) == "completed"
+            if not root_completed:
                 logger.error(
                     "Scan %s ended without calling finish_scan. The agent "
                     "emitted a text-only turn instead of a lifecycle tool call, "
