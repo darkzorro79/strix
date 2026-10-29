@@ -628,10 +628,13 @@ class ReportState:
             raise
 
         md_path = self.get_run_dir() / "vulnerabilities" / f"{report_id}.md"
-        try:
-            md_path.unlink(missing_ok=True)
-        except OSError:
-            logger.exception("could not remove %s", md_path)
+        from strix.report.translate import russian_markdown_path
+
+        for path in (md_path, russian_markdown_path(md_path)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("could not remove %s", path)
 
         logger.info("Deleted vulnerability report %s - %s", report_id, report.get("title"))
         return report

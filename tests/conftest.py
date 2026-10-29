@@ -27,6 +27,16 @@ def _isolate_mcp_config(
 
 
 @pytest.fixture(autouse=True)
+def _english_reports_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep report tests from calling the configured model for a translation.
+
+    Production defaults to a Russian sibling file. The suite opts out unless a
+    test sets ``STRIX_REPORT_LANG`` itself after this fixture.
+    """
+    monkeypatch.setenv("STRIX_REPORT_LANG", "off")
+
+
+@pytest.fixture(autouse=True)
 def _plain_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make Rich output identical on every developer's machine.
 

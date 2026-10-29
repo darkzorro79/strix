@@ -208,6 +208,21 @@ class IntegrationSettings(BaseSettings):
     )
 
 
+class ReportSettings(BaseSettings):
+    model_config = _BASE_CONFIG
+
+    # Extra markdown copy of the executive report and each finding, written
+    # beside the English file (``report.ru.md``, ``vuln-0001.ru.md``).
+    # ``off`` keeps only the English artifacts. The scan's configured model
+    # does the translation when the English file is saved.
+    lang: str = Field(default="ru", alias="STRIX_REPORT_LANG")
+
+    @field_validator("lang", mode="before")
+    @classmethod
+    def _normalize_case(cls, value: object) -> object:
+        return _lowercase(value)
+
+
 class ViewerSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
@@ -226,4 +241,5 @@ class Settings(BaseSettings):
     context: ContextSettings = Field(default_factory=ContextSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     integrations: IntegrationSettings = Field(default_factory=IntegrationSettings)
+    report: ReportSettings = Field(default_factory=ReportSettings)
     viewer: ViewerSettings = Field(default_factory=ViewerSettings)

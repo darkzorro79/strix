@@ -233,11 +233,51 @@ def test_write_vulnerabilities_skips_already_saved_ids(tmp_path: Path) -> None:
     assert (tmp_path / "vulnerabilities.csv").exists()
 
 
+def _async_return(text: str):
+    async def _fake(_markdown: str) -> str:
+        return text
+
+    return _fake
+
+
 def test_write_executive_report_writes_markdown(tmp_path: Path) -> None:
     write_executive_report(tmp_path, "Scan complete. No critical issues.")
     content = (tmp_path / "penetration_test_report.md").read_text(encoding="utf-8")
     assert "# Security Penetration Test Report" in content
     assert "Scan complete. No critical issues." in content
+    assert not (tmp_path / "penetration_test_report.ru.md").exists()
+
+
+def test_write_executive_report_writes_russian_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STRIX_REPORT_LANG", "ru")
+    monkeypatch.setattr(
+        "strix.report.translate._translate",
+        _async_return("# Отчёт\n\nГотово. `scan` без изменений.\n"),
+    )
+
+    write_executive_report(tmp_path, "Scan complete.")
+
+    russian = (tmp_path / "penetration_test_report.ru.md").read_text(encoding="utf-8")
+    assert russian.startswith("# Отчёт")
+    assert "`scan`" in russian
+
+
+def test_write_vulnerabilities_writes_russian_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STRIX_REPORT_LANG", "ru")
+    monkeypatch.setattr(
+        "strix.report.translate._translate",
+        _async_return("# Заголовок\n\nОписание.\n"),
+    )
+
+    write_vulnerabilities(tmp_path, [_sample_report()], set())
+
+    assert (tmp_path / "vulnerabilities" / "vuln-0001.md").is_file()
+    russian = (tmp_path / "vulnerabilities" / "vuln-0001.ru.md").read_text(encoding="utf-8")
+    assert russian.startswith("# Заголовок")
 
 
 def test_render_vulnerability_md_surfaces_calibration_metadata() -> None:

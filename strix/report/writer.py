@@ -138,11 +138,16 @@ def write_run_record(run_dir: Path, run_record: dict[str, Any]) -> None:
 
 def write_executive_report(run_dir: Path, final_scan_result: str) -> None:
     path = run_dir / "penetration_test_report.md"
-    with path.open("w", encoding="utf-8") as f:
-        f.write("# Security Penetration Test Report\n\n")
-        f.write(f"**Generated:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n")
-        f.write(f"{final_scan_result}\n")
+    body = (
+        "# Security Penetration Test Report\n\n"
+        f"**Generated:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        f"{final_scan_result}\n"
+    )
+    atomic_write_text(path, body)
     logger.info("Saved final penetration test report to: %s", path)
+    from strix.report.translate import maybe_write_russian_copy
+
+    maybe_write_russian_copy(path, body)
 
 
 def write_vulnerabilities(
@@ -155,12 +160,14 @@ def write_vulnerabilities(
 
     new_reports = [r for r in vulnerability_reports if r["id"] not in saved_vuln_ids]
 
+    from strix.report.translate import maybe_write_russian_copy
+
     for report in new_reports:
-        atomic_write_text(
-            vuln_dir / f"{report['id']}.md",
-            render_vulnerability_md(report),
-        )
+        md_path = vuln_dir / f"{report['id']}.md"
+        markdown = render_vulnerability_md(report)
+        atomic_write_text(md_path, markdown)
         saved_vuln_ids.add(report["id"])
+        maybe_write_russian_copy(md_path, markdown)
 
     sorted_reports = sorted(
         vulnerability_reports,
