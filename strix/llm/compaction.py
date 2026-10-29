@@ -10,6 +10,7 @@ pairing so the trimmed history is still valid provider input.
 from __future__ import annotations
 
 import logging
+import re
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +53,8 @@ _OVERFLOW_MARKERS = (
     "context length",
     "context window",
     "context_length_exceeded",
+    "available context size",
+    "exceed_context_size",
     "prompt is too long",
     "input is too long",
     "input length",
@@ -60,6 +63,11 @@ _OVERFLOW_MARKERS = (
     "too many tokens",
     "token limit exceeded",
     "request entity too large",
+)
+# llama.cpp-style servers report the hard window as n_ctx / "available context size (N tokens)".
+_CONTEXT_LIMIT_RE = re.compile(
+    r"n_ctx['\"]?\s*[:=]\s*(\d+)|available context size \((\d+)\s*tokens\)",
+    re.IGNORECASE,
 )
 
 
@@ -75,22 +83,51 @@ def _overflow_error_types() -> tuple[type[BaseException], type[BaseException]]:
     return ContextWindowExceededError, BadRequestError
 
 
+def _message_is_overflow(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if any(x in msg for x in _OVERFLOW_EXCLUSIONS):
+        return False
+    return any(x in msg for x in _OVERFLOW_MARKERS)
+
+
+def _is_bad_request(exc: BaseException) -> bool:
+    """LiteLLM's BadRequestError, or any provider 400 (OpenAI SDK included)."""
+    _, bad_request = _overflow_error_types()
+    if isinstance(exc, bad_request):
+        return True
+    return getattr(exc, "status_code", None) == 400
+
+
 def is_context_overflow(exc: BaseException) -> bool:
     """Whether ``exc`` is a model context-window-overflow error.
 
     LiteLLM types most providers' overflow as ContextWindowExceededError, but its
     OpenRouter branch raises a plain BadRequestError, so for that we fall back to
-    matching the provider message.
+    matching the provider message. Local OpenAI-compatible servers (llama.cpp and
+    the like) raise ``openai.BadRequestError`` with ``exceed_context_size_error``
+    instead, which is the same condition.
     """
-    context_window_exceeded, bad_request = _overflow_error_types()
+    context_window_exceeded, _bad_request = _overflow_error_types()
     if isinstance(exc, context_window_exceeded):
         return True
-    if isinstance(exc, bad_request):
-        msg = str(exc).lower()
-        if any(x in msg for x in _OVERFLOW_EXCLUSIONS):
-            return False
-        return any(x in msg for x in _OVERFLOW_MARKERS)
+    if _is_bad_request(exc):
+        return _message_is_overflow(exc)
     return False
+
+
+def overflow_context_limit(exc: BaseException) -> int | None:
+    """Context window advertised by an overflow error, when the server states one."""
+    if not is_context_overflow(exc):
+        return None
+    match = _CONTEXT_LIMIT_RE.search(str(exc))
+    if match is None:
+        return None
+    raw = next(group for group in match.groups() if group)
+    try:
+        limit = int(raw)
+    except ValueError:
+        return None
+    return limit if limit > 0 else None
 
 
 _SUMMARY_INSTRUCTIONS = """\

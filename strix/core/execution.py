@@ -40,7 +40,8 @@ from strix.core.sessions import (
     strip_all_images_from_session,
 )
 from strix.llm import request_log
-from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.llm.compaction import is_context_overflow, maybe_compact, overflow_context_limit
+from strix.llm.context_budget import note_context_window
 from strix.skills import skill_turn_limit
 
 
@@ -179,6 +180,10 @@ def _is_image_rejection(exc: BaseException) -> bool:
 
 
 def _is_transient_model_error(exc: BaseException) -> bool:
+    # A context overflow is deterministic: resending the same prompt fails the
+    # same way. Compaction is the recovery, not a backoff retry.
+    if is_context_overflow(exc):
+        return False
     if codex.is_content_guardrail_error(exc):
         return False
     if isinstance(
@@ -870,11 +875,13 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
                     input_data = []
                     continue
-            if (
-                compactions < _MAX_COMPACTIONS_PER_CYCLE
-                and session is not None
-                and is_context_overflow(exc)
-            ):
+            overflow = is_context_overflow(exc)
+            if overflow:
+                limit = overflow_context_limit(exc)
+                model_name = _run_config_model(run_config)
+                if limit and model_name:
+                    note_context_window(model_name, limit)
+            if compactions < _MAX_COMPACTIONS_PER_CYCLE and session is not None and overflow:
                 try:
                     compacted = await _compact_session(agent, session, run_config, force=True)
                 except Exception:
@@ -889,7 +896,11 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
                     input_data = []
                     continue
-            if model_retries < _MAX_TRANSIENT_MODEL_RETRIES and _is_transient_model_error(exc):
+            if (
+                not overflow
+                and model_retries < _MAX_TRANSIENT_MODEL_RETRIES
+                and _is_transient_model_error(exc)
+            ):
                 model_retries += 1
                 delay = _transient_model_retry_delay(model_retries)
                 logger.warning(

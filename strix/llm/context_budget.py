@@ -26,6 +26,24 @@ _STRIPPABLE_PREFIXES = (
 
 _DEFAULT_OUTPUT_TOKENS = 8_192
 
+# Smallest context window a provider has actually rejected for a model. LiteLLM
+# has no metadata for local model names, so the configured fallback can be larger
+# than the server and proactive compaction never fires.
+_observed_windows: dict[str, int] = {}
+
+
+def note_context_window(model: str, tokens: int) -> None:
+    """Remember a context window the provider enforced for ``model``.
+
+    Later lookups use the smaller of the configured window and this observation,
+    so a recovery compaction sizes its summary to a limit the server will accept.
+    """
+    if tokens <= 0:
+        return
+    current = _observed_windows.get(model)
+    if current is None or tokens < current:
+        _observed_windows[model] = tokens
+
 
 def _lookup_key(model: str) -> str:
     for prefix in _STRIPPABLE_PREFIXES:
@@ -65,7 +83,11 @@ def _model_info(model: str) -> dict[str, int]:
 def context_window(model: str) -> int:
     """Input token capacity for ``model`` (configured fallback when unmapped)."""
     resolved = _model_info(model)["max_input_tokens"]
-    return resolved or load_settings().context.fallback_context_tokens
+    window = resolved or load_settings().context.fallback_context_tokens
+    observed = _observed_windows.get(model)
+    if observed:
+        return min(window, observed)
+    return window
 
 
 def output_limit(model: str) -> int:

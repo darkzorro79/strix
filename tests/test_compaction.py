@@ -97,6 +97,31 @@ def test_is_context_overflow_matches_untyped_openrouter_400() -> None:
     assert compaction.is_context_overflow(openrouter)
 
 
+def test_is_context_overflow_matches_openai_context_size_400() -> None:
+    # Local OpenAI-compatible servers raise openai.BadRequestError, not LiteLLM's type.
+    class BadRequestError(Exception):
+        status_code = 400
+
+    overflow = BadRequestError(
+        "Error code: 400 - {'error': {'code': 400, 'message': "
+        "'request (176454 tokens) exceeds the available context size (163840 tokens), "
+        "try increasing it', 'type': 'exceed_context_size_error', "
+        "'n_prompt_tokens': 176454, 'n_ctx': 163840}}"
+    )
+    assert compaction.is_context_overflow(overflow)
+    assert compaction.overflow_context_limit(overflow) == 163840
+    unrelated = BadRequestError("Invalid value for 'temperature'")
+    assert not compaction.is_context_overflow(unrelated)
+
+
+def test_observed_context_window_caps_fallback() -> None:
+    from strix.llm.context_budget import context_window, note_context_window
+
+    model = "openai/qwen-test-unmapped-context"
+    note_context_window(model, 163840)
+    assert context_window(model) == 163840
+
+
 def test_is_context_overflow_ignores_rate_limit_shaped_bad_request() -> None:
     # A 400 that is really throttling must never be treated as an overflow.
     throttled = BadRequestError(
