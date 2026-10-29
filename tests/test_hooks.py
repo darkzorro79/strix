@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from agents.usage import Usage
 
+from strix.config import loader
 from strix.core.agents import AgentCoordinator
 from strix.core.hooks import (
     BudgetExceededError,
@@ -15,6 +18,11 @@ from strix.core.hooks import (
     SubagentBudgetReservedError,
     recomputed_budget_flags,
 )
+from strix.report.usage import LLMUsageLedger
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _make_hooks(max_budget: float | None) -> ReportUsageHooks:
@@ -83,6 +91,38 @@ async def test_over_budget_raises() -> None:
         pytest.raises(BudgetExceededError),
     ):
         await hooks.on_llm_end(_make_context(), MagicMock(), MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_manual_rates_make_unpriced_model_trip_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("STRIX_LLM", "test-model")
+    monkeypatch.setenv("STRIX_LLM_INPUT_COST_PER_MTOK", "10")
+    monkeypatch.delenv("STRIX_LLM_OUTPUT_COST_PER_MTOK", raising=False)
+    monkeypatch.delenv("STRIX_LLM_CACHED_INPUT_COST_PER_MTOK", raising=False)
+    monkeypatch.setattr(loader, "_override", tmp_path / "missing.json")
+    monkeypatch.setattr(loader, "_cached", None)
+    usage = Usage()
+    usage.requests = 1
+    usage.input_tokens = 1000
+    usage.total_tokens = 1000
+    ledger = LLMUsageLedger()
+
+    class ReportState:
+        def record_sdk_usage(self, **kwargs: Any) -> None:
+            ledger.record(**kwargs)
+
+        def get_total_llm_cost(self) -> float:
+            return ledger.total_cost
+
+    hooks = _make_hooks(0.005)
+    response: Any = SimpleNamespace(usage=usage)
+    with (
+        patch("strix.core.hooks.get_global_report_state", return_value=ReportState()),
+        pytest.raises(BudgetExceededError),
+    ):
+        await hooks.on_llm_end(_make_context(), MagicMock(), response)
 
 
 @pytest.mark.asyncio
