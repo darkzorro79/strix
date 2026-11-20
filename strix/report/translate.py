@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING
 
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
 from strix.config.models import StrixProvider
 from strix.core.inputs import make_model_settings
+from strix.llm import request_log
 
 
 if TYPE_CHECKING:
@@ -128,6 +130,19 @@ def _extract_text(response: ModelResponse) -> str:
     return "".join(parts)
 
 
+def _private_openai_client(
+    api_key: str | None, api_base: str | None, extra_headers: dict[str, str] | None
+) -> AsyncOpenAI:
+    http_client = DefaultAsyncHttpxClient()
+    request_log.observe_http_client(http_client)
+    return AsyncOpenAI(
+        api_key=api_key or os.environ.get("OPENAI_API_KEY") or "not-needed",
+        base_url=api_base or os.environ.get("OPENAI_BASE_URL"),
+        default_headers=dict(extra_headers) if extra_headers else None,
+        http_client=http_client,
+    )
+
+
 async def _translate(markdown: str) -> str | None:
     from strix.config import load_settings
 
@@ -149,22 +164,30 @@ async def _translate(markdown: str) -> str | None:
         extra_body=llm.extra_body,
         has_tools=False,
     ).resolve(ModelSettings(max_tokens=_MAX_OUTPUT_TOKENS))
-    response = await (
-        StrixProvider()
-        .get_model(model)
-        .get_response(
-            system_instructions=_INSTRUCTIONS,
-            input=markdown,
-            model_settings=model_settings,
-            tools=[],
-            output_schema=None,
-            handoffs=[],
-            tracing=ModelTracing.DISABLED,
-            previous_response_id=None,
-            conversation_id=None,
-            prompt=None,
+    # Translation runs on its own short-lived event loop (see _run). The SDK's
+    # shared httpx pool belongs to the scan's loop: a connection opened here
+    # would outlive this loop, and the scan crashes with "Event loop is closed"
+    # once its pool tries to close that connection. So use a private client.
+    client = _private_openai_client(llm.api_key, llm.api_base, llm.extra_headers)
+    try:
+        response = await (
+            StrixProvider(openai_client=client)
+            .get_model(model)
+            .get_response(
+                system_instructions=_INSTRUCTIONS,
+                input=markdown,
+                model_settings=model_settings,
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
         )
-    )
+    finally:
+        await client.close()
     text = _unwrap_fence(_extract_text(response))
     if not text.lstrip().startswith("#"):
         logger.warning("Russian translation did not start with a heading")
