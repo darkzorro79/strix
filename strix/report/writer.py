@@ -147,7 +147,7 @@ def write_executive_report(run_dir: Path, final_scan_result: str) -> None:
     logger.info("Saved final penetration test report to: %s", path)
     from strix.report.translate import maybe_write_russian_copy
 
-    maybe_write_russian_copy(path, body)
+    maybe_write_russian_copy(path, body, digest_key=final_scan_result)
 
 
 def write_vulnerabilities(

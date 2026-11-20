@@ -9,8 +9,11 @@ written. A translation failure is logged and does not fail the save.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures.thread as futures_thread
+import hashlib
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING
 
 from agents.model_settings import ModelSettings
@@ -71,9 +74,50 @@ def russian_markdown_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.ru{path.suffix}")
 
 
-def maybe_write_russian_copy(source: Path, markdown: str) -> None:
-    """Write ``source``'s Russian sibling when translation is enabled."""
+def _translation_digest_path(source: Path) -> Path:
+    """Sidecar recording the English source hash last translated to ``*.ru.md``."""
+    return source.parent / f".{source.name}.ru.sha256"
+
+
+def _source_digest(markdown: str) -> str:
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def _translation_up_to_date(source: Path, digest: str, dest: Path) -> bool:
+    if not dest.is_file():
+        return False
+    stamp = _translation_digest_path(source)
+    try:
+        return stamp.read_text(encoding="utf-8").strip() == digest
+    except OSError:
+        return False
+
+
+def _interpreter_shutting_down() -> bool:
+    # atexit handlers run after the futures executors are closed but before
+    # sys.is_finalizing() turns true; the SDK's asyncio.to_thread fails then.
+    return sys.is_finalizing() or bool(getattr(futures_thread, "_shutdown", False))
+
+
+def maybe_write_russian_copy(source: Path, markdown: str, *, digest_key: str | None = None) -> None:
+    """Write ``source``'s Russian sibling when translation is enabled.
+
+    ``digest_key`` is the content that decides whether a fresh translation is
+    needed; it defaults to ``markdown``. Pass it when ``markdown`` carries a
+    volatile part such as a generation timestamp.
+    """
     if translation_language() != "ru":
+        return
+    dest = russian_markdown_path(source)
+    digest = _source_digest(markdown if digest_key is None else digest_key)
+    if _translation_up_to_date(source, digest, dest):
+        return
+    if _interpreter_shutting_down():
+        logger.info(
+            "Skipping Russian translation during interpreter shutdown for %s (keeping existing %s)",
+            source,
+            dest,
+        )
         return
     try:
         translated = _run(_translate(markdown))
@@ -85,8 +129,12 @@ def maybe_write_russian_copy(source: Path, markdown: str) -> None:
         return
     from strix.report.writer import atomic_write_text
 
-    dest = russian_markdown_path(source)
     atomic_write_text(dest, translated.rstrip() + "\n")
+    digest_path = _translation_digest_path(source)
+    try:
+        digest_path.write_text(digest + "\n", encoding="utf-8")
+    except OSError:
+        logger.warning("Could not write translation digest for %s", source)
     logger.info("Saved Russian translation to: %s", dest)
 
 
